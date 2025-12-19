@@ -464,6 +464,7 @@ export abstract class CommonAvatar {
      * const receipt = await avatar.transfer.direct('0x123...', BigInt(100e18), '0xWrappedTokenAddress...');
      * ```
      */
+    // @todo allow batch
     direct: async (
       to: Address,
       amount: bigint,

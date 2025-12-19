@@ -1,0 +1,41 @@
+{
+  "name": "@aboutcircles/sdk-invitations",
+  "version": "0.1.4",
+  "description": "Circles Invitations Module SDK",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aboutcircles/sdk"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --format esm --minify && tsc --emitDeclarationOnly",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@aboutcircles/sdk-types": "*",
+    "@aboutcircles/sdk-utils": "*",
+    "@aboutcircles/sdk-rpc": "*",
+    "@aboutcircles/sdk-core": "*",
+    "@aboutcircles/sdk-pathfinder": "*"
+  },
+  "devDependencies": {
+    "@esbuild-kit/esm-loader": "^2.6.5",
+    "@types/bun": "^1.2.23",
+    "esbuild": "^0.25.10",
+    "typescript": "^5.0.4"
+  }
+}
