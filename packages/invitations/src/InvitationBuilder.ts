@@ -1,27 +1,32 @@
-import type { Address, TransactionRequest, SimulatedBalance } from '@aboutcircles/sdk-types';
+import type { Address, TransactionRequest } from '@aboutcircles/sdk-types';
 import { CirclesRpc } from '@aboutcircles/sdk-rpc';
 import type { Core } from '@aboutcircles/sdk-core';
 import { InvitationError } from './errors';
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { encodeAbiParameters, parseAbiParameters } from 'viem';
 import { TransferBuilder } from '@aboutcircles/sdk-transfers';
-import { createFlowMatrix } from '@aboutcircles/sdk-pathfinder';
-import { bytesToHex } from '@aboutcircles/sdk-utils';
-
-const INVITATION_MODULE_ADDRESS = '0x00738aca013B7B2e6cfE1690F0021C3182Fa40B5' as Address;
-const INVITATION_FEE = BigInt(96) * BigInt(10 ** 18);
+import {
+  hexToBytes,
+  INVITATION_FEE,
+  MAX_FLOW,
+  generatePrivateKey,
+  privateKeyToAddress,
+  encodeAbiParameters,
+  keccak256,
+  SAFE_PROXY_FACTORY,
+  ACCOUNT_INITIALIZER_HASH,
+  ACCOUNT_CREATION_CODE_HASH,
+  checksumAddress
+} from '@aboutcircles/sdk-utils';
 
 export interface ProxyInviter {
   address: Address;
   possibleInvites: number;
 }
 
-export interface InvitationResult {
+export interface ReferralResult {
   privateKey: `0x${string}`;
-  signerAddress: Address;
   transactions: TransactionRequest[];
 }
-
+// @todo use personal tokens as a priority
 export class InvitationBuilder {
   private core: Core;
   private rpc: CirclesRpc;
@@ -30,100 +35,151 @@ export class InvitationBuilder {
     this.core = core;
     this.rpc = new CirclesRpc(core.config.circlesRpcUrl);
   }
-  /*
-    1.1 User creates an invitation link
-    1.2 New user joins usin the invitation link, by calling claim account
 
-    2.1 New user creates a Safe, with all the required modules (invitation module, either passkeys or regular EOA owner)
-    2.2 User invites the created Safe
-
-
-
-    Go with the replenishment flow, because the tokens might come splited to the invitation module for exmple 50gCRC and 46gCRC
-    
-    For direct invitation:
-    Our goal is to obtain the 96CRC, we should check if the inviter has in total enough CRC
-    If yes:
-      we preapare unwrap calls for the amount we need
-    If no:
-      we prepare the unwrap calls for all the amount
-      and we check the diff the inviter needs
-
-    Create the safeTransferFrom with the invitation module as a recipient
-
-    We calculate the path from the inviter to the inviter, trying to get 96 CRC if needed
-
-
-
-    * generalise the direct invitation an proxy invitation
-  */
-
-  
-
-  // make call to the function trustInviter(address inviter) external 
-  // simulate trust if needed
-
-  // @todo function to generate an invite
-  async createNewSafe(owners: [], modules: Address[]): Promise<Address> {
-    // @todo precalculated addess
-    return '0x0000000000000000000000000000000000000000' as Address;
-  }
-  // @todo rework fully
-  async directInvite(inviter: Address, invitee: Address): Promise<TransactionRequest[]> {
+  /**
+   * Generate invitation transaction for a user who already has a Safe wallet but is not yet registered in Circles Hub
+   *
+   * @param inviter - Address of the inviter
+   * @param invitee - Address of the invitee (must have an existing Safe wallet but NOT be registered in Circles Hub)
+   * @returns Array of transactions to execute in order
+   *
+   * @description
+   * This function:
+   * 1. Verifies the invitee is NOT already registered as a human in Circles Hub
+   * 2. Finds a path from inviter to invitation module using available proxy inviters
+   * 3. Generates invitation data for the existing Safe wallet address
+   * 4. Builds transaction batch with proper wrapped token handling
+   * 5. Returns transactions ready to execute
+   *
+   * Note: The invitee MUST have a Safe wallet but MUST NOT be registered in Circles Hub yet.
+   * If they are already registered, an error will be thrown.
+   */
+  async generateInvite(inviter: Address, invitee: Address): Promise<TransactionRequest[]> {
     const inviterLower = inviter.toLowerCase() as Address;
     const inviteeLower = invitee.toLowerCase() as Address;
-    const invitationFee = BigInt(96e18); // @todo move to constant
 
-    // -------
+    // Step 1: Verify invitee is NOT already registered as a human in Circles Hub
+    const isHuman = await this.core.hubV2.isHuman(inviteeLower);
 
+    if (isHuman) {
+      throw new InvitationError(
+        `Invitee ${inviteeLower} is already registered as a human in Circles Hub. Cannot invite an already registered user.`,
+        {
+          code: 'INVITEE_ALREADY_REGISTERED',
+          source: 'VALIDATION',
+          context: { inviter: inviterLower, invitee: inviteeLower }
+        }
+      );
+    }
+
+    // Step 2: Find path to invitation module using proxy inviters
+    const path = await this.findInvitePath(inviterLower);
+
+    // Step 3: Generate invitation data for existing Safe wallet
+    // For non-registered addresses (existing Safe wallets), we pass their address directly
+    // useSafeCreation = false because the invitee already has a Safe wallet
+    const transferData = await this.generateInviteData([inviteeLower], false);
+
+    // Step 4: Build transactions using TransferBuilder to properly handle wrapped tokens
+    const transferBuilder = new TransferBuilder(this.core.config);
+
+    // Get the proxy inviter address from the path
+    const proxyInviters = await this.getProxyInviters(inviterLower);
+
+    if (proxyInviters.length === 0) {
+      throw InvitationError.noPathFound(inviterLower, this.core.config.invitationModuleAddress);
+    }
+
+    const proxyInviterAddress = proxyInviters[0].address;
+
+    // Use the buildFlowMatrixTx method to construct transactions from the path
+    const transferTransactions = await transferBuilder.buildFlowMatrixTx(
+      inviterLower,
+      this.core.config.invitationModuleAddress,
+      path,
+      {
+        toTokens: [proxyInviterAddress],
+        useWrappedBalances: true,
+        txData: hexToBytes(transferData)
+      },
+      true
+    );
+
+    return transferTransactions;
+  }
+
+  /**
+   * Check if an address has enough personal CRC tokens to cover the invitation fee
+   *
+   * @param address - Address to check
+   * @returns true if the address has enough personal CRC (>= 96 CRC), false otherwise
+   */
+  async hasEnoughPersonalCRC(address: Address): Promise<boolean> {
+    const addressLower = address.toLowerCase() as Address;
+    const tokenId = BigInt(addressLower);
+
+    const balance = await this.core.hubV2.balanceOf(addressLower, tokenId);
+
+    return balance >= INVITATION_FEE;
+  }
+
+  /**
+   * Find a path from inviter to the invitation module for a specific proxy inviter
+   *
+   * @param inviter - Address of the inviter
+   * @param proxyInviterAddress - Optional specific proxy inviter address to use for the path
+   * @returns PathfindingResult containing the transfer path
+   *
+   * @description
+   * This function finds a path from the inviter to the invitation module.
+   * If proxyInviterAddress is provided, it will find a path using that specific token.
+   * Otherwise, it will use the first available proxy inviter.
+   */
+  async findInvitePath(inviter: Address, proxyInviterAddress?: Address) {
+    const inviterLower = inviter.toLowerCase() as Address;
+
+    let tokenToUse: Address;
+
+    if (proxyInviterAddress) {
+      tokenToUse = proxyInviterAddress.toLowerCase() as Address;
+    } else {
+      // Get proxy inviters and use the first one
+      const proxyInviters = await this.getProxyInviters(inviterLower);
+
+      if (proxyInviters.length === 0) {
+        throw InvitationError.noPathFound(inviterLower, this.core.config.invitationModuleAddress);
+      }
+
+      tokenToUse = proxyInviters[0].address;
+    }
+
+    // Find path using the selected token
     const path = await this.rpc.pathfinder.findPath({
       from: inviterLower,
-      to: INVITATION_MODULE_ADDRESS,
-      targetFlow: invitationFee,
-      toTokens: [inviterLower]
+      to: this.core.config.invitationModuleAddress,
+      targetFlow: INVITATION_FEE,
+      toTokens: [tokenToUse],
+      useWrappedBalances: true
     });
 
     if (!path.transfers || path.transfers.length === 0) {
-      throw InvitationError.noPathFound(inviterLower, INVITATION_MODULE_ADDRESS);
+      throw InvitationError.noPathFound(inviterLower, this.core.config.invitationModuleAddress);
     }
 
-    if (path.maxFlow < invitationFee) {
-      throw Error('Update with the new one');
+    if (path.maxFlow < INVITATION_FEE) {
+      const requestedInvites = 1;
+      const availableInvites = Number(path.maxFlow / INVITATION_FEE);
+      throw InvitationError.insufficientBalance(
+        requestedInvites,
+        availableInvites,
+        INVITATION_FEE,
+        path.maxFlow,
+        inviterLower,
+        this.core.config.invitationModuleAddress
+      );
     }
 
-    // @todo check if there is a path found
-    const transactions: TransactionRequest[] = [];
-    // @todo check if we need it
-
-    const isApproved = await this.core.hubV2.isApprovedForAll(inviterLower, inviterLower);
-    if (!isApproved) {
-      transactions.push(this.core.hubV2.setApprovalForAll(inviterLower, true));
-    }
-
-    const flowMatrix = createFlowMatrix(inviterLower, INVITATION_MODULE_ADDRESS, path.maxFlow, path.transfers);
-
-    //@todo here is gonna be only one stream
-    const streamsWithHexData = flowMatrix.streams.map((stream) => ({
-      sourceCoordinate: stream.sourceCoordinate,
-      flowEdgeIds: stream.flowEdgeIds,
-      data: stream.data instanceof Uint8Array ? bytesToHex(stream.data) as `0x${string}` : stream.data as `0x${string}`,
-    }));
-
-    const operateFlowMatrixTx = this.core.hubV2.operateFlowMatrix(
-      flowMatrix.flowVertices as readonly Address[],
-      flowMatrix.flowEdges,
-      streamsWithHexData,
-      flowMatrix.packedCoordinates as `0x${string}`
-    );
-    transactions.push(operateFlowMatrixTx);
-
-    // @todo encode data of the address to invite
-
-    return [];
-  }
-
-  async createInviter() {
-
+    return path;
   }
 
   /**
@@ -137,11 +193,10 @@ export class InvitationBuilder {
    * 1. Gets all addresses that trust the inviter (set1) - includes both one-way trusts and mutual trusts
    * 2. Gets all addresses trusted by the invitation module (set2) - includes both one-way trusts and mutual trusts
    * 3. Finds the intersection of set1 and set2
-   * 4. Creates simulated balances of 10000 CRC for each intersection token held by the inviter
-   * 5. Builds a path from inviter to invitation module using simulated balances and intersection addresses as toTokens
-   * 6. Sums up transferred token amounts by tokenOwner
-   * 7. Calculates possible invites (1 invite = 96 CRC)
-   * 8. Returns only those token owners whose total amounts exceed the invitation fee (96 CRC)
+   * 4. Builds a path from inviter to invitation module using intersection addresses as toTokens
+   * 5. Sums up transferred token amounts by tokenOwner
+   * 6. Calculates possible invites (1 invite = 96 CRC)
+   * 7. Returns only those token owners whose total amounts exceed the invitation fee (96 CRC)
    */
   async getProxyInviters(inviter: Address): Promise<ProxyInviter[]> {
     // @todo separately check if the inviter is trusted by the invitation module and direct invite is possible 
@@ -165,8 +220,8 @@ export class InvitationBuilder {
 
     // Step 2: Get addresses trusted by the invitation module (set2)
     // This includes both one-way outgoing trusts and mutual trusts
-    const trustsRelations = await this.rpc.trust.getTrusts(INVITATION_MODULE_ADDRESS);
-    const mutualTrustRelationsModule = await this.rpc.trust.getMutualTrusts(INVITATION_MODULE_ADDRESS);
+    const trustsRelations = await this.rpc.trust.getTrusts(this.core.config.invitationModuleAddress);
+    const mutualTrustRelationsModule = await this.rpc.trust.getMutualTrusts(this.core.config.invitationModuleAddress);
 
     const trustedByModule = new Set<Address>([
       ...trustsRelations.map(relation => relation.objectAvatar.toLowerCase() as Address),
@@ -186,40 +241,27 @@ export class InvitationBuilder {
     }
 
     const tokensToUse = intersection;
-    console.log('Invitation Module Address:', INVITATION_MODULE_ADDRESS);
+    console.log('Invitation Module Address:', this.core.config.invitationModuleAddress);
     console.log('Addresses that trust inviter:', trustedByInviter.size);
     console.log('Addresses trusted by module:', trustedByModule.size);
     console.log('Intersection (toTokens):', tokensToUse.length, tokensToUse);
 
-    // Step 4: Create simulated balances for the inviter (10000 CRC of each intersection token)
-    const simulatedAmount = BigInt(10000) * BigInt(10 ** 18); // 10000 CRC
-    const simulatedBalances: SimulatedBalance[] = tokensToUse.map(tokenAddress => ({
-      holder: inviterLower,
-      token: tokenAddress,
-      amount: simulatedAmount,
-      isWrapped: false,
-      isStatic: false
-    }));
-
-    console.log('Simulated balances created:', simulatedBalances.length);
-
-    // Step 5: Build path from inviter to invitation module with simulated balances
+    // Step 4: Build path from inviter to invitation module
     const path = await this.rpc.pathfinder.findPath({
       from: inviterLower,
-      to: INVITATION_MODULE_ADDRESS,
+      to: this.core.config.invitationModuleAddress,
       useWrappedBalances: true,
-      targetFlow: BigInt('9999999999999999999999999999999999999'), // @todo move to universal constant file
+      targetFlow: MAX_FLOW,
       toTokens: tokensToUse,
-      //simulatedBalances,
     });
 
     if (!path.transfers || path.transfers.length === 0) {
       return [];
     }
-    //console.log("generated path: ", path);
-    // Step 6: Sum up transferred token amounts by tokenOwner (only terminal transfers to invitation module)
+
+    // Step 5: Sum up transferred token amounts by tokenOwner (only terminal transfers to invitation module)
     const tokenOwnerAmounts = new Map<string, bigint>();
-    const invitationModuleLower = INVITATION_MODULE_ADDRESS.toLowerCase();
+    const invitationModuleLower = this.core.config.invitationModuleAddress.toLowerCase();
 
     for (const transfer of path.transfers) {
       // Only count transfers that go to the invitation module (terminal transfers)
@@ -230,7 +272,7 @@ export class InvitationBuilder {
       }
     }
 
-    // Step 7: Calculate possible invites and filter token owners
+    // Step 6: Calculate possible invites and filter token owners
     const proxyInviters: ProxyInviter[] = [];
 
     for (const [tokenOwner, amount] of tokenOwnerAmounts.entries()) {
@@ -247,20 +289,32 @@ export class InvitationBuilder {
 
     return proxyInviters;
   }
-  // @todo update to the conventional errors
-  async createInvitation(
+  /**
+   * Generate a referral for inviting a new user
+   *
+   * @param inviter - Address of the inviter
+   * @returns Object containing the private key and transaction batch
+   *
+   * @description
+   * This function:
+   * 1. Generates a new private key and signer address for the invitee
+   * 2. Finds a proxy inviter (someone who has balance and is trusted by both inviter and invitation module)
+   * 3. Builds transaction batch including trust, transfers, and invitation
+   * 4. Uses generateInviteData to properly encode the Safe account creation data
+   * 5. Returns the private key (to share with invitee) and transactions (to execute)
+   */
+  async generateReferral(
     inviter: Address
-  ): Promise<InvitationResult> {
+  ): Promise<ReferralResult> {
     const inviterLower = inviter.toLowerCase() as Address;
 
-    // Step 0: Generate private key and derive signer address
+    // Step 1: Generate private key and derive signer address
     const privateKey = generatePrivateKey();
-    const account = privateKeyToAccount(privateKey);
-    const signerAddress = account.address;
+    const signerAddress = privateKeyToAddress(privateKey);
     console.log(`  Private Key: ${privateKey}`);
     console.log(`  Signer Address: ${signerAddress}`);
 
-    // Step 1: Get proxy inviters
+    // Step 2: Get proxy inviters
     const proxyInviters = await this.getProxyInviters(inviterLower);
 
     if (proxyInviters.length === 0) {
@@ -268,95 +322,175 @@ export class InvitationBuilder {
       throw new Error('No proxy inviters found');
     }
 
-    // Step 2: Pick the first proxy inviter
+    // Step 3: Pick the first proxy inviter
     const firstProxyInviter = proxyInviters[0];
     const proxyInviterAddress = firstProxyInviter.address;
 
-    // Step 3: Check if inviter trusts proxy inviter
-    const initiallyTrustsProxy = await this.core.hubV2.isTrusted(inviterLower, proxyInviterAddress);
+    // Step 4: Find path to invitation module
+    const path = await this.findInvitePath(inviterLower, proxyInviterAddress);
 
-    // Step 4: Build transactions using TransferBuilder to properly handle wrapped tokens
-    const invitationAmount = INVITATION_FEE; // 96 CRC
+    // Step 5: Build transactions using TransferBuilder to properly handle wrapped tokens
+    const transferBuilder = new TransferBuilder(this.core.config);
+    // useSafeCreation = true because we're creating a new Safe wallet via ReferralsModule
+    const transferData = await this.generateInviteData([signerAddress], true);
 
-    // Use TransferBuilder to construct the transfer transactions
-    // This handles wrapped tokens, unwrapping, wrapping, and flow matrix creation
-    const transferBuilder = new TransferBuilder(this.core);
-
-    let transferTransactions: TransactionRequest[];
-    try {
-      transferTransactions = await transferBuilder.constructAdvancedTransfer(
-        inviterLower,
-        inviterLower,
-        invitationAmount,
-        {
-          toTokens: [proxyInviterAddress],
-          useWrappedBalances: true,
-          simulatedTrusts: initiallyTrustsProxy ? undefined : [
-            {
-              truster: inviterLower,
-              trustee: proxyInviterAddress
-            }
-          ]
-        }
-      );
-    } catch (error) {
-      throw InvitationError.noPathFound(inviterLower, proxyInviterAddress);
-    }
+    // Use the new buildFlowMatrixTx method to construct transactions from the path
+    const transferTransactions = await transferBuilder.buildFlowMatrixTx(
+      inviterLower,
+      this.core.config.invitationModuleAddress,
+      path,
+      {
+        toTokens: [proxyInviterAddress],
+        useWrappedBalances: true,
+        txData: hexToBytes(transferData)
+      },
+      true
+    );
 
     // Step 6: Build final transaction batch
     const transactions: TransactionRequest[] = [];
-
+    transactions.push(...transferTransactions);
     // TX 1: Trust proxy inviter if not already trusted
     // (TransferBuilder includes approval if needed, so we only add trust if needed)
-    if (!initiallyTrustsProxy) {
-      transactions.push(
-        this.core.hubV2.trust(proxyInviterAddress, BigInt(2) ** BigInt(96) - BigInt(1))
-      );
-    }
 
     // TX 2: Add all transfer transactions (approval, unwraps, operateFlowMatrix, wraps)
-    transactions.push(...transferTransactions);
 
-    // TX 3: Encode createAccount call and use as data for Safe ERC1155 transfer
-    const createAccountTx = this.core.referralsModule.createAccount(signerAddress);
-    const createAccountData = createAccountTx.data as `0x${string}`;
-
-    // Encode (address target, bytes callData) for the invitation module
-    const transferData = encodeAbiParameters(
-      parseAbiParameters('address, bytes'),
-      [this.core.config.referralsModuleAddress, createAccountData]
-    );
-
-    const tokenId = BigInt(proxyInviterAddress);
-
-    const safeTransferTx = this.core.hubV2.safeTransferFrom(
-      inviterLower,
-      INVITATION_MODULE_ADDRESS,
-      tokenId,
-      invitationAmount,
-      transferData
-    );
-    transactions.push(safeTransferTx);
+    // Step 7: Generate invitation data using generateInviteData
+    // This will create the proper data for creating the Safe account via ReferralsModule
 
     // TX 4: Untrust proxy inviter if it wasn't trusted before
-    if (!initiallyTrustsProxy) {
-      transactions.push(
-        this.core.hubV2.trust(proxyInviterAddress, BigInt(0))
-      );
-    }
     // @todo remove before production
     console.log(`\nTotal transactions: ${transactions.length}`);
     console.log('\n=== TRANSACTION BATCH ===');
     console.dir(transactions, { depth: null });
 
-    console.log('\n=== INVITATION RESULT ===');
+    console.log('\n=== REFERRAL RESULT ===');
     console.log(`Private Key: ${privateKey}`);
     console.log(`Signer Address: ${signerAddress}`);
-
+    console.log(`Proxy Inviter: ${proxyInviterAddress}`);
+    // @todo connect the result to the referrals module to track invitations
     return {
       privateKey,
-      signerAddress,
       transactions
     };
   }
+
+  /**
+   * Generate invitation data based on whether addresses need Safe account creation or already have Safe wallets
+   *
+   * @param addresses - Array of addresses to check and encode
+   * @param useSafeCreation - If true, uses ReferralsModule to create Safe accounts (for new users without wallets)
+   * @returns Encoded data for the invitation transfer
+   *
+   * @description
+   * Two modes:
+   * 1. Direct invitation (useSafeCreation = false): Encodes addresses directly for existing Safe wallets
+   * 2. Safe creation (useSafeCreation = true): Uses ReferralsModule to create Safe accounts for new users
+   *
+   * Note: Addresses passed here should NEVER be registered humans in the hub (that's validated before calling this)
+   */
+  async generateInviteData(addresses: Address[], useSafeCreation: boolean = true): Promise<`0x${string}`> {
+    if (addresses.length === 0) {
+      throw new InvitationError(
+        'At least one address must be provided',
+        {
+          code: 'NO_ADDRESSES_PROVIDED',
+          source: 'VALIDATION'
+        }
+      );
+    }
+
+    // If NOT using Safe creation, encode addresses directly (for existing Safe wallets)
+    if (!useSafeCreation) {
+      if (addresses.length === 1) {
+        // Single address - encode as single address (not array)
+        return encodeAbiParameters(
+          ['address'],
+          [addresses[0]]
+        );
+      } else {
+        // Multiple addresses - encode as address array
+        return encodeAbiParameters(
+          ['address[]'],
+          [addresses]
+        );
+      }
+    }
+
+    // Use ReferralsModule to create Safe accounts for new users (signers without Safe wallets)
+    if (addresses.length === 1) {
+      // Single address - use createAccount(address signer)
+      const createAccountTx = this.core.referralsModule.createAccount(addresses[0]);
+      const createAccountData = createAccountTx.data as `0x${string}`;
+
+      // Encode (address target, bytes callData) for the invitation module
+      return encodeAbiParameters(
+        ['address', 'bytes'],
+        [this.core.config.referralsModuleAddress, createAccountData]
+      );
+    } else {
+      // Multiple addresses - use createAccounts(address[] signers)
+      const createAccountsTx = this.core.referralsModule.createAccounts(addresses);
+      const createAccountsData = createAccountsTx.data as `0x${string}`;
+
+      // Encode (address target, bytes callData) for the invitation module
+      return encodeAbiParameters(
+        ['address', 'bytes'],
+        [this.core.config.referralsModuleAddress, createAccountsData]
+      );
+    }
+  }
+
+  /**
+   * Predicts the pre-made Safe address for a given signer without deploying it
+   * Uses CREATE2 with ACCOUNT_INITIALIZER_HASH and ACCOUNT_CREATION_CODE_HASH via SAFE_PROXY_FACTORY
+   *
+   * @param signer - The offchain public address chosen by the origin inviter as the pre-deployment key
+   * @returns The deterministic Safe address that would be deployed for the signer
+   *
+   * @description
+   * This implements the same logic as the ReferralsModule.computeAddress() contract function:
+   * ```solidity
+   * bytes32 salt = keccak256(abi.encodePacked(ACCOUNT_INITIALIZER_HASH, uint256(uint160(signer))));
+   * predictedAddress = address(
+   *   uint160(
+   *     uint256(
+   *       keccak256(
+   *         abi.encodePacked(bytes1(0xff), address(SAFE_PROXY_FACTORY), salt, ACCOUNT_CREATION_CODE_HASH)
+   *       )
+   *     )
+   *   )
+   * );
+   * ```
+   */
+  computeAddress(signer: Address): Address {
+    // Step 1: Calculate salt = keccak256(abi.encodePacked(ACCOUNT_INITIALIZER_HASH, uint256(uint160(signer))))
+    // abi.encodePacked means concatenate without padding
+    // uint256(uint160(signer)) converts address to uint256 (32 bytes, left-padded with zeros)
+
+    const signerLower = signer.toLowerCase().replace('0x', '');
+    const signerUint256 = signerLower.padStart(64, '0'); // 32 bytes as hex string
+
+    // Concatenate: ACCOUNT_INITIALIZER_HASH (32 bytes) + signerUint256 (32 bytes)
+    const saltPreimage = ACCOUNT_INITIALIZER_HASH.replace('0x', '') + signerUint256;
+    const salt = keccak256(('0x' + saltPreimage) as `0x${string}`);
+
+    // Step 2: Calculate CREATE2 address
+    // address = keccak256(0xff ++ factory ++ salt ++ initCodeHash)[12:]
+
+    const ff = 'ff';
+    const factory = SAFE_PROXY_FACTORY.toLowerCase().replace('0x', '');
+    const saltClean = salt.replace('0x', '');
+    const initCodeHash = ACCOUNT_CREATION_CODE_HASH.replace('0x', '');
+
+    // Concatenate all parts
+    const create2Preimage = ff + factory + saltClean + initCodeHash;
+    const hash = keccak256(('0x' + create2Preimage) as `0x${string}`);
+
+    // Take last 20 bytes (40 hex chars) as the address
+    const addressHex = '0x' + hash.slice(-40);
+
+    return checksumAddress(addressHex) as Address;
+  }
+
 }

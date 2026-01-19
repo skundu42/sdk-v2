@@ -11,6 +11,46 @@
       "import": "./dist/index.js",
       "require": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./hubV2": {
+      "types": "./dist/contracts/hubV2.d.ts",
+      "default": "./dist/contracts/hubV2.js"
+    },
+    "./baseGroup": {
+      "types": "./dist/contracts/baseGroup.d.ts",
+      "default": "./dist/contracts/baseGroup.js"
+    },
+    "./baseGroupFactory": {
+      "types": "./dist/contracts/baseGroupFactory.d.ts",
+      "default": "./dist/contracts/baseGroupFactory.js"
+    },
+    "./nameRegistry": {
+      "types": "./dist/contracts/nameRegistry.d.ts",
+      "default": "./dist/contracts/nameRegistry.js"
+    },
+    "./liftERC20": {
+      "types": "./dist/contracts/liftERC20.d.ts",
+      "default": "./dist/contracts/liftERC20.js"
+    },
+    "./invitationEscrow": {
+      "types": "./dist/contracts/invitationEscrow.d.ts",
+      "default": "./dist/contracts/invitationEscrow.js"
+    },
+    "./invitationFarm": {
+      "types": "./dist/contracts/invitationFarm.d.ts",
+      "default": "./dist/contracts/invitationFarm.js"
+    },
+    "./referralsModule": {
+      "types": "./dist/contracts/referralsModule.d.ts",
+      "default": "./dist/contracts/referralsModule.js"
+    },
+    "./inflationaryCircles": {
+      "types": "./dist/contracts/inflationaryCircles.d.ts",
+      "default": "./dist/contracts/inflationaryCircles.js"
+    },
+    "./demurrageCircles": {
+      "types": "./dist/contracts/demurrageCircles.d.ts",
+      "default": "./dist/contracts/demurrageCircles.js"
     }
   },
   "files": [
@@ -22,7 +62,7 @@
   },
   "license": "MIT",
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --format esm --minify && tsc --emitDeclarationOnly",
+    "build": "bun build ./src/index.ts --outdir ./dist --format esm --minify --splitting && tsc --emitDeclarationOnly",
     "dev": "tsc --watch"
   },
   "dependencies": {
