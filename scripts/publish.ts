@@ -16,6 +16,7 @@ const packages = [
   'rpc',            // RPC client - depends on types, utils
   'pathfinder',     // Pathfinder - depends on types, utils
   'transfers',      // Transfers - depends on types, core, pathfinder
+  'invitations',    // Invitations - depends on types, utils, rpc, core, transfers
   'runner',         // Contract runner - depends on sdk
   'sdk',            // Main SDK - depends on most packages
 ];
