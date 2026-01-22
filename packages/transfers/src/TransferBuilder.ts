@@ -6,7 +6,7 @@ import {
   getWrappedTokensFromPath,
   replaceWrappedTokensWithAvatars,
 } from '@aboutcircles/sdk-pathfinder';
-import { CirclesRpc } from '@aboutcircles/sdk-rpc';
+import { RpcClient, PathfinderMethods, BalanceMethods, GroupMethods } from '@aboutcircles/sdk-rpc';
 import { CirclesConverter } from '@aboutcircles/sdk-utils/circlesConverter';
 import { ZERO_ADDRESS } from '@aboutcircles/sdk-utils/constants';
 import { HubV2Contract } from '@aboutcircles/sdk-core/hubV2';
@@ -24,7 +24,10 @@ export class TransferBuilder {
   private config: CirclesConfig;
   private hubV2: HubV2Contract;
   private liftERC20: LiftERC20Contract;
-  private rpc: CirclesRpc;
+  private rpcClient: RpcClient;
+  private pathfinder: PathfinderMethods;
+  private balance: BalanceMethods;
+  private group: GroupMethods;
 
   constructor(config: CirclesConfig) {
     this.config = config;
@@ -36,7 +39,10 @@ export class TransferBuilder {
       address: config.liftERC20Address,
       rpcUrl: config.circlesRpcUrl,
     });
-    this.rpc = new CirclesRpc(config.circlesRpcUrl);
+    this.rpcClient = new RpcClient(config.circlesRpcUrl);
+    this.pathfinder = new PathfinderMethods(this.rpcClient);
+    this.balance = new BalanceMethods(this.rpcClient);
+    this.group = new GroupMethods(this.rpcClient);
   }
 
   /**
@@ -245,7 +251,7 @@ export class TransferBuilder {
       ...(completeExcludeFromTokens ? { excludeFromTokens: completeExcludeFromTokens } : {}),
     };
 
-    let path = await this.rpc.pathfinder.findPath({
+    let path = await this.pathfinder.findPath({
       from: fromAddr,
       to: toAddr,
       targetFlow: truncatedAmount,
@@ -300,19 +306,21 @@ export class TransferBuilder {
    * );
    * ```
    */
+  // @todo review the impleementation
   async constructReplenish(
     from: Address,
     tokenId: Address,
     amount: bigint,
     receiver?: Address
   ): Promise<Array<{ to: Address; data: `0x${string}`; value: bigint }>> {
+
     const fromAddr = from.toLowerCase() as Address;
     const tokenIdAddr = tokenId.toLowerCase() as Address;
     const receiverAddr = (receiver || from).toLowerCase() as Address;
     const amountBigInt = BigInt(amount);
 
     // Step 1: Check current balances (unwrapped + wrapped)
-    const balances = await this.rpc.balance.getTokenBalances(fromAddr);
+    const balances = await this.balance.getTokenBalances(fromAddr);
 
     // Filter balances for the target token
     const targetTokenBalances = balances.filter(
@@ -459,7 +467,7 @@ export class TransferBuilder {
 
     let path: PathfindingResult;
     try {
-      path = await this.rpc.pathfinder.findPath({
+      path = await this.pathfinder.findPath({
         from: fromAddr,
         to: receiverAddr,
         targetFlow: roundedUpDeficit,
@@ -625,7 +633,7 @@ export class TransferBuilder {
    * @returns Map of token address to balance (in static units)
    */
   private async _getTokenBalanceMap(from: Address): Promise<Map<string, bigint>> {
-    const allBalances = await this.rpc.balance.getTokenBalances(from);
+    const allBalances = await this.balance.getTokenBalances(from);
     const balanceMap = new Map<string, bigint>();
     // @todo remove any
     allBalances.forEach((balance: any) => {
@@ -761,7 +769,7 @@ export class TransferBuilder {
     excludeFromTokens?: Address[]
   ): Promise<Address[] | undefined> {
     // Check if recipient is a group mint handler
-    const groups = await this.rpc.group.findGroups(1, {
+    const groups = await this.group.findGroups(1, {
       mintHandlerEquals: to,
     });
 

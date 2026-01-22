@@ -22,7 +22,7 @@
   },
   "license": "MIT",
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --format esm --minify && tsc --emitDeclarationOnly",
+    "build": "bun build ./src/index.ts --outdir ./dist --format esm --minify --splitting && tsc --emitDeclarationOnly",
     "dev": "tsc --watch"
   },
   "dependencies": {
@@ -30,7 +30,7 @@
     "@aboutcircles/sdk-utils": "*",
     "@aboutcircles/sdk-rpc": "*",
     "@aboutcircles/sdk-core": "*",
-    "@aboutcircles/sdk-pathfinder": "*"
+    "@aboutcircles/sdk-transfers": "*"
   },
   "devDependencies": {
     "@esbuild-kit/esm-loader": "^2.6.5",

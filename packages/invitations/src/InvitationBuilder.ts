@@ -1,5 +1,5 @@
 import type { Address, TransactionRequest } from '@aboutcircles/sdk-types';
-import { CirclesRpc } from '@aboutcircles/sdk-rpc';
+import { RpcClient, PathfinderMethods, TrustMethods } from '@aboutcircles/sdk-rpc';
 import type { Core } from '@aboutcircles/sdk-core';
 import { InvitationError } from './errors';
 import { TransferBuilder } from '@aboutcircles/sdk-transfers';
@@ -28,11 +28,15 @@ export interface ProxyInviter {
  */
 export class InvitationBuilder {
   private core: Core;
-  private rpc: CirclesRpc;
+  private rpcClient: RpcClient;
+  private pathfinder: PathfinderMethods;
+  private trust: TrustMethods;
 
   constructor(core: Core) {
     this.core = core;
-    this.rpc = new CirclesRpc(core.config.circlesRpcUrl);
+    this.rpcClient = new RpcClient(core.config.circlesRpcUrl);
+    this.pathfinder = new PathfinderMethods(this.rpcClient);
+    this.trust = new TrustMethods(this.rpcClient);
   }
 
   /**
@@ -169,21 +173,6 @@ export class InvitationBuilder {
   }
 
   /**
-   * Check if an address has enough personal CRC tokens to cover the invitation fee
-   *
-   * @param address - Address to check
-   * @returns true if the address has enough personal CRC (>= 96 CRC), false otherwise
-   */
-  async hasEnoughPersonalCRC(address: Address): Promise<boolean> {
-    const addressLower = address.toLowerCase() as Address;
-    const tokenId = BigInt(addressLower);
-
-    const balance = await this.core.hubV2.balanceOf(addressLower, tokenId);
-
-    return balance >= INVITATION_FEE;
-  }
-
-  /**
    * Find a path from inviter to the invitation module for a specific proxy inviter
    *
    * @param inviter - Address of the inviter
@@ -214,7 +203,7 @@ export class InvitationBuilder {
     }
 
     // Find path using the selected token
-    const path = await this.rpc.pathfinder.findPath({
+    const path = await this.pathfinder.findPath({
       from: inviterLower,
       to: this.core.config.invitationModuleAddress,
       targetFlow: INVITATION_FEE,
@@ -265,8 +254,8 @@ export class InvitationBuilder {
 
     // Step 1: Get addresses that trust the inviter (set1)
     // This includes both one-way incoming trusts and mutual trusts
-    const trustedByRelations = await this.rpc.trust.getTrustedBy(inviterLower);
-    const mutualTrustRelations = await this.rpc.trust.getMutualTrusts(inviterLower);
+    const trustedByRelations = await this.trust.getTrustedBy(inviterLower);
+    const mutualTrustRelations = await this.trust.getMutualTrusts(inviterLower);
 
     // Extract the addresses of avatars who trust the inviter
     // Combine both trustedBy (one-way) and mutualTrusts
@@ -277,8 +266,8 @@ export class InvitationBuilder {
 
     // Step 2: Get addresses trusted by the invitation module (set2)
     // This includes both one-way outgoing trusts and mutual trusts
-    const trustsRelations = await this.rpc.trust.getTrusts(this.core.config.invitationModuleAddress);
-    const mutualTrustRelationsModule = await this.rpc.trust.getMutualTrusts(this.core.config.invitationModuleAddress);
+    const trustsRelations = await this.trust.getTrusts(this.core.config.invitationModuleAddress);
+    const mutualTrustRelationsModule = await this.trust.getMutualTrusts(this.core.config.invitationModuleAddress);
 
     const trustedByModule = new Set<Address>([
       ...trustsRelations.map(relation => relation.objectAvatar.toLowerCase() as Address),
@@ -303,7 +292,7 @@ export class InvitationBuilder {
     }
 
     // Step 5: Build path from inviter to invitation module
-    const path = await this.rpc.pathfinder.findPath({
+    const path = await this.pathfinder.findPath({
       from: inviterLower,
       to: this.core.config.invitationModuleAddress,
       useWrappedBalances: true,
