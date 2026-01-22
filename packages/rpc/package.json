@@ -1,6 +1,6 @@
 {
   "name": "@aboutcircles/sdk-rpc",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Circles RPC wrapper",
   "type": "module",
   "main": "./dist/index.js",
