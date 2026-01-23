@@ -23,10 +23,10 @@ export interface ProxyInviter {
 }
 
 /**
- * InvitationBuilder handles invitation operations for Circles
+ * Invitations handles invitation operations for Circles
  * Supports both referral invitations (new users) and direct invitations (existing Safe wallets)
  */
-export class InvitationBuilder {
+export class Invitations {
   private config: CirclesConfig;
   private rpcClient: RpcClient;
   private pathfinder: PathfinderMethods;
@@ -360,7 +360,7 @@ export class InvitationBuilder {
    * Generate a referral for inviting a new user
    *
    * @param inviter - Address of the inviter
-   * @returns Array of transactions to execute in order
+   * @returns Object containing transactions and the generated private key
    *
    * @description
    * This function:
@@ -369,14 +369,11 @@ export class InvitationBuilder {
    * 3. Builds transaction batch including transfers and invitation
    * 4. Uses generateInviteData to properly encode the Safe account creation data
    * 5. Saves the referral data (private key, signer, inviter) to database
-   * 6. Returns transactions ready to execute
-   *
-   * Note: The private key is saved via saveReferralData and not returned.
-   * Retrieve it from the database using the inviter and signer addresses.
+   * 6. Returns transactions and the generated private key
    */
   async generateReferral(
     inviter: Address
-  ): Promise<TransactionRequest[]> {
+  ): Promise<{ transactions: TransactionRequest[]; privateKey: `0x${string}` }> {
     const inviterLower = inviter.toLowerCase() as Address;
 
     // Step 1: Generate private key and derive signer address
@@ -422,7 +419,7 @@ export class InvitationBuilder {
     const transactions: TransactionRequest[] = [];
     transactions.push(...transferTransactions);
 
-    return transactions;
+    return { transactions, privateKey };
   }
 
   /**
