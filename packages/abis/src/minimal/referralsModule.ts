@@ -1,5 +1,5 @@
 /**
- * Minimal ABI for ReferralsModule contract - only functions used by InvitationBuilder
+ * Minimal ABI for ReferralsModule contract - only functions used by Invitations
  * Full ABI is ~500 lines, this is ~50 lines
  */
 export const referralsModuleMinimalAbi = [

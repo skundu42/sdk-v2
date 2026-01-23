@@ -3,7 +3,7 @@ import { referralsModuleMinimalAbi } from '@aboutcircles/sdk-abis/minimal';
 import type { Address, TransactionRequest } from '@aboutcircles/sdk-types';
 
 /**
- * Minimal ReferralsModule Contract for InvitationBuilder
+ * Minimal ReferralsModule Contract for Invitations
  * Contains only the methods required for building invitation transactions
  */
 export class ReferralsModuleContractMinimal extends Contract<typeof referralsModuleMinimalAbi> {
