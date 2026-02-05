@@ -1,6 +1,6 @@
-import type { Address, TransactionRequest, CirclesConfig } from '@aboutcircles/sdk-types';
+import type { Address, TransactionRequest, CirclesConfig, Hex } from '@aboutcircles/sdk-types';
 import { RpcClient, PathfinderMethods, TrustMethods } from '@aboutcircles/sdk-rpc';
-import { HubV2ContractMinimal, ReferralsModuleContractMinimal } from '@aboutcircles/sdk-core/minimal';
+import { HubV2ContractMinimal, ReferralsModuleContractMinimal, InvitationFarmContractMinimal } from '@aboutcircles/sdk-core/minimal';
 import { InvitationError } from './errors';
 import type { ReferralPreviewList } from './types';
 import { TransferBuilder } from '@aboutcircles/sdk-transfers';
@@ -24,6 +24,25 @@ export interface ProxyInviter {
 }
 
 /**
+ * Fallback destination address for farm-based invitations
+ * Used when no direct invitation path is available
+ */
+const FARM_DESTINATION = '0x9Eb51E6A39B3F17bB1883B80748b56170039ff1d' as Address;
+
+/**
+ * Gnosis group address used to filter out already-trusted accounts
+ * Accounts trusted by this group are excluded from real inviters
+ * @todo Set the actual gnosis group address
+ */
+const GNOSIS_GROUP_ADDRESS = '0xc19bc204eb1c1d5b3fe500e5e5dfabab625f286c' as Address; // TODO: Set actual address
+
+/**
+ * Token address used for farm-based invitations
+ * @todo Set the actual token address
+ */
+const FARM_TO_TOKEN = '0xc19bc204eb1c1d5b3fe500e5e5dfabab625f286c' as Address; // TODO: Set actual address
+
+/**
  * Invitations handles invitation operations for Circles
  * Supports both referral invitations (new users) and direct invitations (existing Safe wallets)
  */
@@ -34,6 +53,7 @@ export class Invitations {
   private trust: TrustMethods;
   private hubV2: HubV2ContractMinimal;
   private referralsModule: ReferralsModuleContractMinimal;
+  private invitationFarm: InvitationFarmContractMinimal;
 
   constructor(config: CirclesConfig) {
     if (!config.referralsServiceUrl) {
@@ -53,6 +73,10 @@ export class Invitations {
     });
     this.referralsModule = new ReferralsModuleContractMinimal({
       address: config.referralsModuleAddress,
+      rpcUrl: config.circlesRpcUrl,
+    });
+    this.invitationFarm = new InvitationFarmContractMinimal({
+      address: config.invitationFarmAddress,
       rpcUrl: config.circlesRpcUrl,
     });
   }
@@ -191,37 +215,53 @@ export class Invitations {
    * If they are already registered, an error will be thrown.
    */
   async generateInvite(inviter: Address, invitee: Address): Promise<TransactionRequest[]> {
+    console.log('[generateInvite] Starting invite generation for existing Safe wallet user');
+    console.log('[generateInvite] Inviter:', inviter);
+    console.log('[generateInvite] Invitee:', invitee);
+
     const inviterLower = inviter.toLowerCase() as Address;
     const inviteeLower = invitee.toLowerCase() as Address;
 
     // Step 1: Verify invitee is NOT already registered as a human in Circles Hub
+    console.log('[generateInvite] Step 1: Checking if invitee is already registered in Hub...');
     const isHuman = await this.hubV2.isHuman(inviteeLower);
+    console.log('[generateInvite] Invitee isHuman:', isHuman);
 
     if (isHuman) {
+      console.log('[generateInvite] ERROR: Invitee is already registered');
       throw InvitationError.inviteeAlreadyRegistered(inviterLower, inviteeLower);
     }
 
     // Step 2: Find path to invitation module using proxy inviters
+    console.log('[generateInvite] Step 2: Finding path to invitation module...');
     const path = await this.findInvitePath(inviterLower);
+    console.log('[generateInvite] Path found with', path.transfers?.length || 0, 'transfers');
 
     // Step 3: Generate invitation data for existing Safe wallet
+    console.log('[generateInvite] Step 3: Generating invitation data for existing Safe wallet...');
     // For non-registered addresses (existing Safe wallets), we pass their address directly
     // useSafeCreation = false because the invitee already has a Safe wallet
     const transferData = await this.generateInviteData([inviteeLower], false);
+    console.log('[generateInvite] Transfer data generated');
 
     // Step 4: Build transactions using TransferBuilder to properly handle wrapped tokens
+    console.log('[generateInvite] Step 4: Getting real inviters...');
     const transferBuilder = new TransferBuilder(this.config);
 
     // Get the real inviter address from the path
     const realInviters = await this.getRealInviters(inviterLower);
+    console.log('[generateInvite] Found', realInviters.length, 'real inviters');
 
     if (realInviters.length === 0) {
+      console.log('[generateInvite] ERROR: No proxy inviters found');
       throw InvitationError.noPathFound(inviterLower, this.config.invitationModuleAddress);
     }
 
     const realInviterAddress = realInviters[0].address;
+    console.log('[generateInvite] Using real inviter:', realInviterAddress);
 
-    // Use the buildFlowMatrixTx method to construct transactions from the path
+    // Step 5: Build flow matrix transactions
+    console.log('[generateInvite] Step 5: Building flow matrix transactions...');
     const transferTransactions = await transferBuilder.buildFlowMatrixTx(
       inviterLower,
       this.config.invitationModuleAddress,
@@ -233,6 +273,8 @@ export class Invitations {
       },
       true
     );
+    console.log('[generateInvite] Built', transferTransactions.length, 'transactions');
+    console.log('[generateInvite] Complete');
 
     return transferTransactions;
   }
@@ -250,24 +292,34 @@ export class Invitations {
    * Otherwise, it will use the first available proxy inviter.
    */
   async findInvitePath(inviter: Address, proxyInviterAddress?: Address) {
+    console.log('[findInvitePath] Finding path to invitation module');
+    console.log('[findInvitePath] Inviter:', inviter);
+    console.log('[findInvitePath] Proxy inviter address:', proxyInviterAddress || 'not specified');
+
     const inviterLower = inviter.toLowerCase() as Address;
 
     let tokenToUse: Address;
 
     if (proxyInviterAddress) {
       tokenToUse = proxyInviterAddress.toLowerCase() as Address;
+      console.log('[findInvitePath] Using provided proxy inviter token:', tokenToUse);
     } else {
       // Get real inviters and use the first one
+      console.log('[findInvitePath] No proxy inviter specified, getting real inviters...');
       const realInviters = await this.getRealInviters(inviterLower);
 
       if (realInviters.length === 0) {
+        console.log('[findInvitePath] ERROR: No real inviters found');
         throw InvitationError.noPathFound(inviterLower, this.config.invitationModuleAddress);
       }
 
       tokenToUse = realInviters[0].address;
+      console.log('[findInvitePath] Using first real inviter token:', tokenToUse);
     }
 
     // Find path using the selected token
+    console.log('[findInvitePath] Finding path from', inviterLower, 'to invitation module');
+    console.log('[findInvitePath] Target flow:', INVITATION_FEE.toString(), '(96 CRC)');
     const path = await this.pathfinder.findPath({
       from: inviterLower,
       to: this.config.invitationModuleAddress,
@@ -276,11 +328,15 @@ export class Invitations {
       useWrappedBalances: true
     });
 
+    console.log('[findInvitePath] Path result - maxFlow:', path.maxFlow?.toString(), 'transfers:', path.transfers?.length || 0);
+
     if (!path.transfers || path.transfers.length === 0) {
+      console.log('[findInvitePath] ERROR: No path found (empty transfers)');
       throw InvitationError.noPathFound(inviterLower, this.config.invitationModuleAddress);
     }
 
     if (path.maxFlow < INVITATION_FEE) {
+      console.log('[findInvitePath] ERROR: Insufficient flow -', path.maxFlow.toString(), '<', INVITATION_FEE.toString());
       const requestedInvites = 1;
       const availableInvites = Number(path.maxFlow / INVITATION_FEE);
       throw InvitationError.insufficientBalance(
@@ -293,6 +349,60 @@ export class Invitations {
       );
     }
 
+    console.log('[findInvitePath] Path found successfully');
+    return path;
+  }
+
+  /**
+   * Find a fallback path from inviter to the farm destination
+   *
+   * @param inviter - Address of the inviter
+   * @returns PathfindingResult containing the transfer path to the farm
+   *
+   * @description
+   * This function finds a path from the inviter to the farm destination (0x9Eb51E6A39B3F17bB1883B80748b56170039ff1d)
+   * using FARM_TO_TOKEN as the target token. Used when no standard proxy inviters are available.
+   */
+  async findFarmInvitePath(inviter: Address) {
+    console.log('[findFarmInvitePath] Finding fallback path to farm destination');
+    console.log('[findFarmInvitePath] Inviter:', inviter);
+    console.log('[findFarmInvitePath] Farm destination:', FARM_DESTINATION);
+    console.log('[findFarmInvitePath] Farm token:', FARM_TO_TOKEN);
+
+    const inviterLower = inviter.toLowerCase() as Address;
+
+    // Find path to farm destination using the farm token
+    console.log('[findFarmInvitePath] Target flow:', INVITATION_FEE.toString(), '(96 CRC)');
+    const path = await this.pathfinder.findPath({
+      from: inviterLower,
+      to: FARM_DESTINATION,
+      targetFlow: INVITATION_FEE,
+      toTokens: [FARM_TO_TOKEN],
+      useWrappedBalances: true
+    });
+
+    console.log('[findFarmInvitePath] Path result - maxFlow:', path.maxFlow?.toString(), 'transfers:', path.transfers?.length || 0);
+
+    if (!path.transfers || path.transfers.length === 0) {
+      console.log('[findFarmInvitePath] ERROR: No path found to farm');
+      throw InvitationError.noPathFound(inviterLower, FARM_DESTINATION);
+    }
+
+    if (path.maxFlow < INVITATION_FEE) {
+      console.log('[findFarmInvitePath] ERROR: Insufficient flow -', path.maxFlow.toString(), '<', INVITATION_FEE.toString());
+      const requestedInvites = 1;
+      const availableInvites = Number(path.maxFlow / INVITATION_FEE);
+      throw InvitationError.insufficientBalance(
+        requestedInvites,
+        availableInvites,
+        INVITATION_FEE,
+        path.maxFlow,
+        inviterLower,
+        FARM_DESTINATION
+      );
+    }
+
+    console.log('[findFarmInvitePath] Farm path found successfully');
     return path;
   }
 
@@ -307,20 +417,23 @@ export class Invitations {
    * This function:
    * 1. Gets all addresses that trust the inviter (set1) - includes both one-way trusts and mutual trusts
    * 2. Gets all addresses trusted by the invitation module (set2) - includes both one-way trusts and mutual trusts
-   * 3. Verifies that the inviter is trusted by the invitation module (throws error if not)
-   * 4. Finds the intersection of set1 and set2
-   * 5. Adds the inviter's own address to the list of possible tokens
-   * 6. Builds a path from inviter to invitation module using intersection addresses as toTokens
-   * 7. Sums up transferred token amounts by tokenOwner
-   * 8. Calculates possible invites (1 invite = 96 CRC)
-   * 9. Orders real inviters by preference (best candidates first)
-   * 10. Returns only those token owners whose total amounts exceed the invitation fee (96 CRC)
+   * 3. Gets all addresses trusted by the gnosis group (set3) - these will be excluded
+   * 4. Verifies that the inviter is trusted by the invitation module (throws error if not)
+   * 5. Finds the intersection of set1 and set2, excluding addresses in set3
+   * 6. Adds the inviter's own address to the list of possible tokens
+   * 7. Builds a path from inviter to invitation module using intersection addresses as toTokens
+   * 8. Sums up transferred token amounts by tokenOwner
+   * 9. Calculates possible invites (1 invite = 96 CRC)
+   * 10. Orders real inviters by preference (best candidates first)
+   * 11. Returns only those token owners whose total amounts exceed the invitation fee (96 CRC)
    */
   async getRealInviters(inviter: Address): Promise<ProxyInviter[]> {
+    console.log('[getRealInviters] Finding valid proxy inviters for:', inviter);
+
     const inviterLower = inviter.toLowerCase() as Address;
 
     // Step 1: Get addresses that trust the inviter (set1)
-    // This includes both one-way incoming trusts and mutual trusts
+    console.log('[getRealInviters] Step 1: Getting addresses that trust the inviter...');
     const trustedByRelations = await this.trust.getTrustedBy(inviterLower);
     const mutualTrustRelations = await this.trust.getMutualTrusts(inviterLower);
 
@@ -330,10 +443,13 @@ export class Invitations {
       ...trustedByRelations.map(relation => relation.objectAvatar.toLowerCase() as Address),
       ...mutualTrustRelations.map(relation => relation.objectAvatar.toLowerCase() as Address)
     ]);
+    console.log('[getRealInviters] Set1 (trust inviter):', trustedByInviter.size, 'addresses');
 
     // Step 2: Get addresses trusted by the invitation module (set2)
+    // This includes both one-way outgoing trusts and mutual trusts
+    console.log('[getRealInviters] Step 2: Getting addresses trusted by invitation module...');
     // getTrusts returns only one-way outgoing trusts, so we also need getMutualTrusts
-    // to catch addresses that mistakenly trusted the module back (creating a mutual trust)
+    // to catch addresses that trusted the module back (creating a mutual trust)
     const [trustsRelations, moduleMutualTrustRelations] = await Promise.all([
       this.trust.getTrusts(this.config.invitationModuleAddress),
       this.trust.getMutualTrusts(this.config.invitationModuleAddress),
@@ -342,11 +458,28 @@ export class Invitations {
       ...trustsRelations.map(relation => relation.objectAvatar.toLowerCase() as Address),
       ...moduleMutualTrustRelations.map(relation => relation.objectAvatar.toLowerCase() as Address),
     ]);
+    console.log('[getRealInviters] Set2 (trusted by module):', trustedByModule.size, 'addresses');
 
-    // Step 3: Check if inviter is trusted by the invitation module
-    // If not, the inviter needs to enable the invitation module first
+    // Step 3: Get addresses trusted by the gnosis group (set3) - these will be excluded
+    console.log('[getRealInviters] Step 3: Getting addresses trusted by gnosis group (to exclude)...');
+    console.log('[getRealInviters] Gnosis group address:', GNOSIS_GROUP_ADDRESS);
+    let trustedByGnosisGroup = new Set<Address>();
+    if (GNOSIS_GROUP_ADDRESS !== '0x0000000000000000000000000000000000000000') {
+      const gnosisGroupTrusts = await this.trust.getTrusts(GNOSIS_GROUP_ADDRESS);
+      trustedByGnosisGroup = new Set<Address>([
+        ...gnosisGroupTrusts.map(relation => relation.objectAvatar.toLowerCase() as Address),
+      ]);
+      console.log('[getRealInviters] Set3 (trusted by gnosis group - EXCLUDED):', trustedByGnosisGroup.size, 'addresses');
+    } else {
+      console.log('[getRealInviters] Gnosis group not configured (zero address), skipping exclusion');
+    }
+
+    // Step 4: Check if inviter is trusted by the invitation module
+    console.log('[getRealInviters] Step 4: Checking if inviter is trusted by invitation module...');
     const inviterTrustedByModule = trustedByModule.has(inviterLower);
+    console.log('[getRealInviters] Inviter trusted by module:', inviterTrustedByModule);
     if (!inviterTrustedByModule) {
+      console.log('[getRealInviters] ERROR: Inviter must enable the invitation module first');
       throw new InvitationError('Inviter must enable the invitation module before creating invitations', {
         code: 'INVITATION_MODULE_NOT_ENABLED',
         source: 'INVITATIONS',
@@ -354,23 +487,35 @@ export class Invitations {
       });
     }
 
-    // Step 4: Find intersection - addresses that trust inviter AND are trusted by invitation module
+    // Step 5: Find intersection - addresses that trust inviter AND are trusted by invitation module
+    // AND are NOT trusted by the gnosis group
+    console.log('[getRealInviters] Step 5: Finding intersection (Set1 ∩ Set2 - Set3)...');
     const intersection: Address[] = [];
     for (const address of trustedByInviter) {
-      if (trustedByModule.has(address)) {
+      if (trustedByModule.has(address) && !trustedByGnosisGroup.has(address)) {
         intersection.push(address);
       }
     }
+    console.log('[getRealInviters] Intersection size:', intersection.length);
 
-    // Step 5: Add the inviter's own address to the list of possible tokens
-    // This allows the inviter to use their own personal tokens for invitations
-    const tokensToUse = [...intersection, inviterLower];
+    // Step 6: Add the inviter's own address to the list of possible tokens
+    console.log('[getRealInviters] Step 6: Adding inviter address if not excluded by gnosis group...');
+    const tokensToUse = [...intersection];
+    const inviterExcluded = trustedByGnosisGroup.has(inviterLower);
+    console.log('[getRealInviters] Inviter excluded by gnosis group:', inviterExcluded);
+    if (!inviterExcluded) {
+      tokensToUse.push(inviterLower);
+    }
+    console.log('[getRealInviters] Total tokens to use:', tokensToUse.length);
 
     // If no tokens available at all, return empty
     if (tokensToUse.length === 0) {
+      console.log('[getRealInviters] No tokens available, returning empty array');
       return [];
     }
-    // Step 6: Build path from inviter to invitation module
+
+    // Step 7: Build path from inviter to invitation module
+    console.log('[getRealInviters] Step 7: Building path to calculate possible invites...');
     const path = await this.pathfinder.findPath({
       from: inviterLower,
       to: this.config.invitationModuleAddress,
@@ -378,12 +523,15 @@ export class Invitations {
       targetFlow: MAX_FLOW,
       toTokens: tokensToUse,
     });
+    console.log('[getRealInviters] Path found with', path.transfers?.length || 0, 'transfers');
 
     if (!path.transfers || path.transfers.length === 0) {
+      console.log('[getRealInviters] No transfers in path, returning empty array');
       return [];
     }
 
-    // Step 7: Sum up transferred token amounts by tokenOwner (only terminal transfers to invitation module)
+    // Step 8: Sum up transferred token amounts by tokenOwner (only terminal transfers to invitation module)
+    console.log('[getRealInviters] Step 8: Summing token amounts by owner...');
     const tokenOwnerAmounts = new Map<string, bigint>();
     const invitationModuleLower = this.config.invitationModuleAddress.toLowerCase();
 
@@ -395,12 +543,15 @@ export class Invitations {
         tokenOwnerAmounts.set(tokenOwnerLower, currentAmount + transfer.value);
       }
     }
+    console.log('[getRealInviters] Unique token owners with terminal transfers:', tokenOwnerAmounts.size);
 
-    // Step 8: Calculate possible invites and filter token owners
+    // Step 9: Calculate possible invites and filter token owners
+    console.log('[getRealInviters] Step 9: Calculating possible invites per token owner...');
     const realInviters: ProxyInviter[] = [];
 
     for (const [tokenOwner, amount] of tokenOwnerAmounts.entries()) {
       const possibleInvites = Number(amount / INVITATION_FEE);
+      console.log('[getRealInviters]   Token owner:', tokenOwner, '- amount:', amount.toString(), '- possible invites:', possibleInvites);
 
       if (possibleInvites >= 1) {
         realInviters.push({
@@ -410,9 +561,14 @@ export class Invitations {
       }
     }
 
-    // Step 9: Order real inviters by preference (best candidates first)
-    // Prioritizes the inviter's own tokens first
+    // Step 10: Order real inviters by preference (best candidates first)
+    console.log('[getRealInviters] Step 10: Ordering real inviters by preference...');
     const orderedRealInviters = this.orderRealInviters(realInviters, inviterLower);
+
+    console.log('[getRealInviters] Final result:', orderedRealInviters.length, 'valid proxy inviters');
+    for (const ri of orderedRealInviters) {
+      console.log('[getRealInviters]   -', ri.address, '(', ri.possibleInvites, 'invites)');
+    }
 
     return orderedRealInviters;
   }
@@ -420,66 +576,130 @@ export class Invitations {
    * Generate a referral for inviting a new user
    *
    * @param inviter - Address of the inviter
-   * @returns Object containing transactions and the generated private key
+   * @returns Object containing transactions, the generated private key, and whether farm was used
    *
    * @description
    * This function:
    * 1. Generates a new private key and signer address for the invitee
-   * 2. Finds a proxy inviter (someone who has balance and is trusted by both inviter and invitation module)
-   * 3. Builds transaction batch including transfers and invitation
-   * 4. Uses generateInviteData to properly encode the Safe account creation data
-   * 5. Saves the referral data (private key, signer, inviter) to database
-   * 6. Returns transactions and the generated private key
+   * 2. Tries to find proxy inviters (accounts that trust inviter, trusted by module, NOT trusted by gnosis group)
+   * 3. If no proxy inviters found, falls back to farm-based invitation:
+   *    - Sends 96 CRC to FARM_DESTINATION to increase quota on the invitation farm
+   *    - Then uses the farm (claimInvite + safeTransferFrom) to create the referral
+   * 4. Builds transaction batch including transfers and invitation
+   * 5. Uses generateInviteData to properly encode the Safe account creation data
+   * 6. Saves the referral data (private key, signer, inviter) to database
+   * 7. Returns transactions and the generated private key
    */
   async generateReferral(
     inviter: Address
-  ): Promise<{ transactions: TransactionRequest[]; privateKey: `0x${string}` }> {
+  ): Promise<{ transactions: TransactionRequest[]; privateKey: `0x${string}`; usedFarm: boolean }> {
+    console.log('[generateReferral] Starting referral generation for new user');
+    console.log('[generateReferral] Inviter:', inviter);
+
     const inviterLower = inviter.toLowerCase() as Address;
-    // @todo use `generateSecrets` here
+
     // Step 1: Generate private key and derive signer address
+    console.log('[generateReferral] Step 1: Generating private key and signer address...');
     const privateKey = generatePrivateKey();
     const signerAddress = privateKeyToAddress(privateKey);
+    console.log('[generateReferral] Generated signer address:', signerAddress);
 
-    // Step 2: Get real inviters
+    // Step 2: Get real inviters (filtered by gnosis group)
+    console.log('[generateReferral] Step 2: Getting real inviters (filtered by gnosis group)...');
     const realInviters = await this.getRealInviters(inviterLower);
+    console.log('[generateReferral] Found', realInviters.length, 'real inviters');
 
-    if (realInviters.length === 0) {
-      throw InvitationError.noProxyInviters(inviterLower);
+    const transactions: TransactionRequest[] = [];
+    let usedFarm = false;
+
+    if (realInviters.length > 0) {
+      // Standard path: use proxy inviters
+      console.log('[generateReferral] Using STANDARD PATH (proxy inviters available)');
+      console.log('[generateReferral] Step 3a: Generating invite data with Safe creation...');
+      const transferBuilder = new TransferBuilder(this.config);
+      const transferData = await this.generateInviteData([signerAddress], true);
+
+      const realInviterAddress = realInviters[0].address;
+      console.log('[generateReferral] Step 3b: Finding path using real inviter:', realInviterAddress);
+      const path = await this.findInvitePath(inviterLower, realInviterAddress);
+
+      console.log('[generateReferral] Step 3c: Building flow matrix transactions...');
+      const transferTransactions = await transferBuilder.buildFlowMatrixTx(
+        inviterLower,
+        this.config.invitationModuleAddress,
+        path,
+        {
+          toTokens: [realInviterAddress],
+          useWrappedBalances: true,
+          txData: hexToBytes(transferData)
+        },
+        true
+      );
+      transactions.push(...transferTransactions);
+      console.log('[generateReferral] Built', transferTransactions.length, 'transactions via standard path');
+    } else {
+      // Fallback: use farm-based invitation path
+      // 1. Send 96 CRC to the dispatcher to increase quota on the farm
+      // 2. claimInvite() to claim a token ID from the farm (uses the quota)
+      // 3. safeTransferFrom() to transfer the claimed token to the invitation module
+      //    with createAccount calldata for the new signer
+      console.log('[generateReferral] Using FARM FALLBACK PATH (no proxy inviters available)');
+
+      // Farm Step 1: Send 96 CRC to dispatcher to increase quota
+      console.log('[generateReferral] Farm Step 1: Finding path to dispatcher...');
+      const transferBuilder = new TransferBuilder(this.config);
+      const farmPath = await this.findFarmInvitePath(inviterLower);
+
+      const quotaTransactions = await transferBuilder.buildFlowMatrixTx(
+        inviterLower,
+        FARM_DESTINATION,
+        farmPath,
+        {
+          toTokens: [FARM_TO_TOKEN],
+          useWrappedBalances: true
+        },
+        true
+      );
+      transactions.push(...quotaTransactions);
+      console.log('[generateReferral] Built', quotaTransactions.length, 'quota increase transactions');
+
+      // Farm Step 2: Simulate claim to get the token ID, then build claim tx
+      console.log('[generateReferral] Farm Step 2: Simulating claim to get token ID...');
+      const claimedId = await this.invitationFarm.read('claimInvite', [], { from: inviterLower }) as bigint;
+      console.log('[generateReferral] Simulated claimed token ID:', claimedId.toString());
+
+      const claimTx = this.invitationFarm.claimInvite();
+      transactions.push(claimTx);
+
+      // Farm Step 3: Transfer claimed token to invitation module with createAccount calldata
+      console.log('[generateReferral] Farm Step 3: Building safeTransferFrom...');
+      const invitationModule = await this.invitationFarm.invitationModule();
+      const createAccountCalldata = this.referralsModule.createAccount(signerAddress).data as Hex;
+      const transferData = encodeAbiParameters(
+        ['address', 'bytes'],
+        [this.config.referralsModuleAddress, createAccountCalldata]
+      );
+
+      const safeTransferTx = this.hubV2.safeTransferFrom(
+        inviterLower,
+        invitationModule,
+        claimedId,
+        INVITATION_FEE,
+        transferData
+      );
+      transactions.push(safeTransferTx);
+
+      usedFarm = true;
+      console.log('[generateReferral] Farm fallback transactions:', transactions.length);
     }
 
-    // Step 3: Pick the first real inviter
-    const firstRealInviter = realInviters[0];
-    const realInviterAddress = firstRealInviter.address;
-
-    // Step 4: Find path to invitation module
-    const path = await this.findInvitePath(inviterLower, realInviterAddress);
-
-    // Step 5: Build transactions using TransferBuilder to properly handle wrapped tokens
-    const transferBuilder = new TransferBuilder(this.config);
-    // useSafeCreation = true because we're creating a new Safe wallet via ReferralsModule
-    const transferData = await this.generateInviteData([signerAddress], true);
-
-    // Use the new buildFlowMatrixTx method to construct transactions from the path
-    const transferTransactions = await transferBuilder.buildFlowMatrixTx(
-      inviterLower,
-      this.config.invitationModuleAddress,
-      path,
-      {
-        toTokens: [realInviterAddress],
-        useWrappedBalances: true,
-        txData: hexToBytes(transferData)
-      },
-      true
-    );
-
-    // Step 6: Save referral data to database
+    // Save referral data to database
+    console.log('[generateReferral] Saving referral data to database...');
     await this.saveReferralData(inviterLower, privateKey);
+    console.log('[generateReferral] Referral data saved');
 
-    // Step 7: Build final transaction batch
-    const transactions: TransactionRequest[] = [];
-    transactions.push(...transferTransactions);
-
-    return { transactions, privateKey };
+    console.log('[generateReferral] Complete - usedFarm:', usedFarm, '- total transactions:', transactions.length);
+    return { transactions, privateKey, usedFarm };
   }
 
   /**
