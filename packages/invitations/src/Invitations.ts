@@ -370,13 +370,15 @@ export class Invitations {
       tokenToUse = realInviters[0].address;
     }
 
-    // Find path using the selected token
+    // Find path using the selected token.
+    // Simulate the module trusting the inviter in case enableModule/trustInviter txs are not yet on-chain.
     const path = await this.pathfinder.findPath({
       from: inviterLower,
       to: this.config.invitationModuleAddress,
       targetFlow: INVITATION_FEE,
       toTokens: [tokenToUse],
-      useWrappedBalances: true
+      useWrappedBalances: true,
+      simulatedTrusts: [{ truster: this.config.invitationModuleAddress, trustee: inviterLower }],
     });
 
 
@@ -516,6 +518,7 @@ export class Invitations {
       useWrappedBalances: true,
       targetFlow: MAX_FLOW,
       toTokens: tokensToUse,
+      simulatedTrusts: [{ truster: this.config.invitationModuleAddress, trustee: inviterLower }],
     });
 
     if (!path.transfers || path.transfers.length === 0) {
