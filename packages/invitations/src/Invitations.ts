@@ -1,5 +1,5 @@
 import type { Address, TransactionRequest, CirclesConfig, Hex } from '@aboutcircles/sdk-types';
-import { RpcClient, PathfinderMethods, TrustMethods } from '@aboutcircles/sdk-rpc';
+import { RpcClient, PathfinderMethods, TrustMethods, TokenMethods } from '@aboutcircles/sdk-rpc';
 import {
   HubV2ContractMinimal,
   ReferralsModuleContractMinimal,
@@ -45,6 +45,7 @@ export class Invitations {
   private rpcClient: RpcClient;
   private pathfinder: PathfinderMethods;
   private trust: TrustMethods;
+  private token: TokenMethods;
   private hubV2: HubV2ContractMinimal;
   private referralsModule: ReferralsModuleContractMinimal;
   private invitationFarm: InvitationFarmContractMinimal;
@@ -62,6 +63,7 @@ export class Invitations {
     this.rpcClient = new RpcClient(config.circlesRpcUrl);
     this.pathfinder = new PathfinderMethods(this.rpcClient);
     this.trust = new TrustMethods(this.rpcClient);
+    this.token = new TokenMethods(this.rpcClient);
     this.hubV2 = new HubV2ContractMinimal({
       address: config.v2HubAddress,
       rpcUrl: config.circlesRpcUrl,
@@ -368,13 +370,15 @@ export class Invitations {
       tokenToUse = realInviters[0].address;
     }
 
-    // Find path using the selected token
+    // Find path using the selected token.
+    // Simulate the module trusting the inviter in case enableModule/trustInviter txs are not yet on-chain.
     const path = await this.pathfinder.findPath({
       from: inviterLower,
       to: this.config.invitationModuleAddress,
       targetFlow: INVITATION_FEE,
       toTokens: [tokenToUse],
-      useWrappedBalances: true
+      useWrappedBalances: true,
+      simulatedTrusts: [{ truster: this.config.invitationModuleAddress, trustee: inviterLower }],
     });
 
 
@@ -450,125 +454,116 @@ export class Invitations {
    *
    * @description
    * This function:
-   * 1. Gets all addresses that trust the inviter (set1) - includes both one-way trusts and mutual trusts
-   * 2. Gets all addresses trusted by the invitation module (set2) - includes both one-way trusts and mutual trusts
-   * 3. Gets all addresses trusted by the gnosis group (set3) - these will be excluded
-   * 4. Finds the intersection of set1 and set2, excluding addresses in set3
-   * 5. Adds the inviter's own address to the list of possible tokens
-   * 6. Builds a path from inviter to invitation module using intersection addresses as toTokens
-   * 7. Sums up transferred token amounts by tokenOwner
-   * 8. Calculates possible invites (1 invite = 96 CRC)
-   * 9. Orders real inviters by preference (best candidates first)
-   * 10. Returns only those token owners whose total amounts exceed the invitation fee (96 CRC)
+   * @description
+   * set1 = addresses trusted by the Gnosis group (excluded from proxy inviters)
+   * set2 = addresses that trust the inviter (potential token sources)
+   * set3 = addresses trusted by the invitation module (can receive those tokens)
+   * Proxy inviters = (set2 ∩ set3) − set1
+   *
+   * Only (set2 ∩ set3) − set1 addresses are passed to the pathfinder as toTokens.
+   * Wrapped ERC20 token addresses returned by the pathfinder are resolved back to their real
+   * human avatar owners via getTokenInfoBatch before amounts are summed.
    */
   async getRealInviters(inviter: Address): Promise<ProxyInviter[]> {
-    console.log('[getRealInviters] Finding valid proxy inviters for:', inviter);
-
     const inviterLower = inviter.toLowerCase() as Address;
 
-    // Step 1: Get addresses that trust the inviter (set1)
-    const trustedByRelations = await this.trust.getTrustedBy(inviterLower);
-    const mutualTrustRelations = await this.trust.getMutualTrusts(inviterLower);
-
-    // Extract the addresses of avatars who trust the inviter
-    // Combine both trustedBy (one-way) and mutualTrusts
-    const trustedByInviter = new Set<Address>([
-      ...trustedByRelations.map(relation => relation.objectAvatar.toLowerCase() as Address),
-      ...mutualTrustRelations.map(relation => relation.objectAvatar.toLowerCase() as Address)
-    ]);
-
-    // Step 2: Get addresses trusted by the invitation module (set2)
-    // This includes both one-way outgoing trusts and mutual trusts
-    // getTrusts returns only one-way outgoing trusts, so we also need getMutualTrusts
-    // to catch addresses that trusted the module back (creating a mutual trust)
-    const [trustsRelations, moduleMutualTrustRelations] = await Promise.all([
+    // set1: addresses trusted by the Gnosis group — excluded from proxy inviters
+    // set2: addresses that trust the inviter — potential token sources
+    // set3: addresses trusted by the invitation module — can receive those tokens
+    // Proxy inviters = (set2 ∩ set3) − set1
+    const [
+      gnosisGroupTrusts,
+      trustsInviterRelations,
+      mutualTrustRelations,
+      moduleTrustsRelations,
+      moduleMutualTrustRelations,
+    ] = await Promise.all([
+      GNOSIS_GROUP_ADDRESS !== '0x0000000000000000000000000000000000000000'
+        ? this.trust.getTrusts(GNOSIS_GROUP_ADDRESS)
+        : Promise.resolve([]),
+      this.trust.getTrustedBy(inviterLower),
+      this.trust.getMutualTrusts(inviterLower),
       this.trust.getTrusts(this.config.invitationModuleAddress),
       this.trust.getMutualTrusts(this.config.invitationModuleAddress),
     ]);
-    const trustedByModule = new Set<Address>([
-      ...trustsRelations.map(relation => relation.objectAvatar.toLowerCase() as Address),
-      ...moduleMutualTrustRelations.map(relation => relation.objectAvatar.toLowerCase() as Address),
+
+    // set1: trusted by Gnosis group
+    const set1 = new Set<Address>(
+      gnosisGroupTrusts.map(r => r.objectAvatar.toLowerCase() as Address)
+    );
+
+    // set2: addresses that trust the inviter (one-way + mutual)
+    const set2 = new Set<Address>([
+      ...trustsInviterRelations.map(r => r.objectAvatar.toLowerCase() as Address),
+      ...mutualTrustRelations.map(r => r.objectAvatar.toLowerCase() as Address),
     ]);
 
-    // Step 3: Get addresses trusted by the gnosis group (set3) - these will be excluded
-    let trustedByGnosisGroup = new Set<Address>();
-    if (GNOSIS_GROUP_ADDRESS !== '0x0000000000000000000000000000000000000000') {
-      const gnosisGroupTrusts = await this.trust.getTrusts(GNOSIS_GROUP_ADDRESS);
-      trustedByGnosisGroup = new Set<Address>([
-        ...gnosisGroupTrusts.map(relation => relation.objectAvatar.toLowerCase() as Address),
-      ]);
-    } else {
-    }
+    // set3: addresses trusted by the invitation module (one-way + mutual)
+    const set3 = new Set<Address>([
+      ...moduleTrustsRelations.map(r => r.objectAvatar.toLowerCase() as Address),
+      ...moduleMutualTrustRelations.map(r => r.objectAvatar.toLowerCase() as Address),
+    ]);
 
-    // Step 4: Find intersection - addresses that trust inviter AND are trusted by invitation module
-    // AND are NOT trusted by the gnosis group
-    const intersection: Address[] = [];
-    for (const address of trustedByInviter) {
-      if (trustedByModule.has(address) && !trustedByGnosisGroup.has(address)) {
-        intersection.push(address);
-      }
-    }
+    // (set2 ∩ set3) − set1: trust the inviter, trusted by the module, not in the Gnosis group
+    const intersection = [...set2].filter(a => set3.has(a) && !set1.has(a));
+    const tokensToUse = [...intersection, inviterLower];
 
-    // Step 5: Add the inviter's own address to the list of possible tokens
-    const tokensToUse = [...intersection];
-    const inviterExcluded = trustedByGnosisGroup.has(inviterLower);
-    if (!inviterExcluded) {
-      tokensToUse.push(inviterLower);
-    }
-
-    // If no tokens available at all, return empty
     if (tokensToUse.length === 0) {
       return [];
     }
 
-    // Step 6: Build path from inviter to invitation module
     const path = await this.pathfinder.findPath({
       from: inviterLower,
       to: this.config.invitationModuleAddress,
       useWrappedBalances: true,
       targetFlow: MAX_FLOW,
       toTokens: tokensToUse,
+      simulatedTrusts: [{ truster: this.config.invitationModuleAddress, trustee: inviterLower }],
     });
 
     if (!path.transfers || path.transfers.length === 0) {
       return [];
     }
 
-    // Step 7: Sum up transferred token amounts by tokenOwner (only terminal transfers to invitation module)
-    const tokenOwnerAmounts = new Map<string, bigint>();
+    // Only count transfers arriving at the invitation module (terminal transfers)
     const invitationModuleLower = this.config.invitationModuleAddress.toLowerCase();
+    const terminalTransfers = path.transfers.filter(
+      t => t.to.toLowerCase() === invitationModuleLower
+    );
 
-    for (const transfer of path.transfers) {
-      // Only count transfers that go to the invitation module (terminal transfers)
-      if (transfer.to.toLowerCase() === invitationModuleLower) {
-        const tokenOwnerLower = transfer.tokenOwner.toLowerCase();
-        const currentAmount = tokenOwnerAmounts.get(tokenOwnerLower) || BigInt(0);
-        tokenOwnerAmounts.set(tokenOwnerLower, currentAmount + transfer.value);
+    // Resolve wrapped ERC20 token addresses to their real human avatar owners.
+    // The pathfinder uses the wrapped token address as tokenOwner, but the real proxy
+    // inviter is the human avatar who owns the underlying ERC1155 token.
+    // Note: the RPC returns `tokenAddress` rather than `token` as the TokenInfo type declares.
+    const rawOwners = [...new Set(terminalTransfers.map(t => t.tokenOwner.toLowerCase() as Address))];
+    const tokenInfos = await this.token.getTokenInfoBatch(rawOwners);
+
+    const ownerRemap = new Map<string, string>();
+    for (const info of tokenInfos) {
+      const tokenAddr = ((info as any).tokenAddress ?? info.token) as Address | undefined;
+      if (tokenAddr && info?.tokenOwner) {
+        ownerRemap.set(tokenAddr.toLowerCase(), info.tokenOwner.toLowerCase());
       }
     }
 
-    // Step 8: Calculate possible invites and filter token owners
-    const realInviters: ProxyInviter[] = [];
+    // Sum amounts by resolved (real) owner
+    const tokenOwnerAmounts = new Map<string, bigint>();
+    for (const transfer of terminalTransfers) {
+      const rawOwner = transfer.tokenOwner.toLowerCase();
+      const resolvedOwner = ownerRemap.get(rawOwner) ?? rawOwner;
+      tokenOwnerAmounts.set(resolvedOwner, (tokenOwnerAmounts.get(resolvedOwner) ?? 0n) + transfer.value);
+    }
 
+    // Build result: require >= 1 full invite worth of flow
+    const realInviters: ProxyInviter[] = [];
     for (const [tokenOwner, amount] of tokenOwnerAmounts.entries()) {
       const possibleInvites = Number(amount / INVITATION_FEE);
-
       if (possibleInvites >= 1) {
-        realInviters.push({
-          address: tokenOwner as Address,
-          possibleInvites
-        });
+        realInviters.push({ address: tokenOwner as Address, possibleInvites });
       }
     }
 
-    // Step 9: Order real inviters by preference (best candidates first)
-    const orderedRealInviters = this.orderRealInviters(realInviters, inviterLower);
-
-    console.log('[getRealInviters] Final result:', orderedRealInviters.length, 'valid proxy inviters');
-    for (const ri of orderedRealInviters) {
-    }
-
-    return orderedRealInviters;
+    return this.orderRealInviters(realInviters, inviterLower);
   }
   /**
    * Generate a referral for inviting a new user
