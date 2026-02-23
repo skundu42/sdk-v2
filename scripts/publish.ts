@@ -30,11 +30,8 @@ async function publishPackage(pkg: string): Promise<boolean> {
   // Read package.json to get actual name and version
   const pkgJsonPath = join(pkgPath, 'package.json');
   const pkgJson = JSON.parse(await $`cat ${pkgJsonPath}`.text());
-  const pkgName = pkgJson.name;
-  const version = pkgJson.version;
   const pkgName = pkgJson.name ?? `@aboutcircles/sdk-${pkg}`;
-  console.log(`\n📦 Publishing ${pkgName}...`);
-
+  const version = pkgJson.version;
   console.log(`\n📦 Publishing ${pkgName}...`);
 
   try {
