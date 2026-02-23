@@ -18,6 +18,7 @@ const packages = [
   "invitations",
   "runner",
   "sdk",
+  "miniapp-sdk",
 ];
 
 // Get current version from main SDK
