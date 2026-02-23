@@ -19,6 +19,7 @@ const packages = [
   'invitations',    // Invitations - depends on types, utils, rpc, core, transfers
   'runner',         // Contract runner - depends on sdk
   'sdk',            // Main SDK - depends on most packages
+  'miniapp-sdk',    // Mini app iframe SDK - standalone
 ];
 
 const packagesDir = join(process.cwd(), 'packages');
@@ -31,6 +32,8 @@ async function publishPackage(pkg: string): Promise<boolean> {
   const pkgJson = JSON.parse(await $`cat ${pkgJsonPath}`.text());
   const pkgName = pkgJson.name;
   const version = pkgJson.version;
+  const pkgName = pkgJson.name ?? `@aboutcircles/sdk-${pkg}`;
+  console.log(`\n📦 Publishing ${pkgName}...`);
 
   console.log(`\n📦 Publishing ${pkgName}...`);
 
