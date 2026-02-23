@@ -30,53 +30,55 @@ const _dataListeners: DataListener[] = [];
 let _requestCounter = 0;
 const _pending: Record<string, PendingRequest<unknown>> = {};
 
-window.addEventListener('message', (event: MessageEvent) => {
-  const d = event.data as { type: string; [key: string]: unknown };
-  if (!d || !d.type) return;
+if (typeof window !== 'undefined') {
+  window.addEventListener('message', (event: MessageEvent) => {
+    const d = event.data as { type: string; [key: string]: unknown };
+    if (!d || !d.type) return;
 
-  switch (d.type) {
-    case 'app_data':
-      _dataListeners.forEach((fn) => fn(d.data as string));
-      break;
+    switch (d.type) {
+      case 'app_data':
+        _dataListeners.forEach((fn) => fn(d.data as string));
+        break;
 
-    case 'wallet_connected':
-      _address = d.address as string;
-      _listeners.forEach((fn) => fn(_address));
-      break;
+      case 'wallet_connected':
+        _address = d.address as string;
+        _listeners.forEach((fn) => fn(_address));
+        break;
 
-    case 'wallet_disconnected':
-      _address = null;
-      _listeners.forEach((fn) => fn(null));
-      break;
+      case 'wallet_disconnected':
+        _address = null;
+        _listeners.forEach((fn) => fn(null));
+        break;
 
-    case 'tx_success':
-      (_pending[d.requestId as string] as PendingRequest<string[]>)?.resolve(d.hashes as string[]);
-      delete _pending[d.requestId as string];
-      break;
+      case 'tx_success':
+        (_pending[d.requestId as string] as PendingRequest<string[]>)?.resolve(d.hashes as string[]);
+        delete _pending[d.requestId as string];
+        break;
 
-    case 'tx_rejected':
-      _pending[d.requestId as string]?.reject(new Error((d.error ?? d.reason ?? 'Rejected') as string));
-      delete _pending[d.requestId as string];
-      break;
+      case 'tx_rejected':
+        _pending[d.requestId as string]?.reject(new Error((d.error ?? d.reason ?? 'Rejected') as string));
+        delete _pending[d.requestId as string];
+        break;
 
-    case 'sign_success':
-      (_pending[d.requestId as string] as PendingRequest<SignResult>)?.resolve({
-        signature: d.signature as string,
-        verified: d.verified as boolean,
-      });
-      delete _pending[d.requestId as string];
-      break;
+      case 'sign_success':
+        (_pending[d.requestId as string] as PendingRequest<SignResult>)?.resolve({
+          signature: d.signature as string,
+          verified: d.verified as boolean,
+        });
+        delete _pending[d.requestId as string];
+        break;
 
-    case 'sign_rejected':
-      _pending[d.requestId as string]?.reject(new Error((d.error ?? d.reason ?? 'Rejected') as string));
-      delete _pending[d.requestId as string];
-      break;
+      case 'sign_rejected':
+        _pending[d.requestId as string]?.reject(new Error((d.error ?? d.reason ?? 'Rejected') as string));
+        delete _pending[d.requestId as string];
+        break;
+    }
+  });
+
+  // Ask the host for the current wallet state on load
+  if (window.parent !== window) {
+    window.parent.postMessage({ type: 'request_address' }, '*');
   }
-});
-
-// Ask the host for the current wallet state on load
-if (window.parent !== window) {
-  window.parent.postMessage({ type: 'request_address' }, '*');
 }
 
 /**
